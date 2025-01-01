@@ -3,6 +3,8 @@ use std::{sync::mpsc::Receiver, thread::JoinHandle, time::Duration};
 use egui_extras::{Column, TableBuilder};
 use rumqttc::{Client, Event, Incoming, MqttOptions};
 
+use crate::mqtt_servermanager::{MqttServerManager, MqttServerManagerEvent};
+
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
@@ -15,13 +17,15 @@ pub struct TemplateApp {
     send_payload: String,
 
     #[serde(skip)]
+    manager: MqttServerManager,
+    #[serde(skip)]
     mqtt_client: Option<Client>,
     #[serde(skip)]
     mqtt_jh: Option<JoinHandle<()>>,
     #[serde(skip)]
     mqtt_receiver: Option<Receiver<Event>>,
     #[serde(skip)]
-    incoming: Vec<Event>,
+    incoming: Vec<MqttServerManagerEvent>,
 }
 
 impl Default for TemplateApp {
@@ -32,6 +36,7 @@ impl Default for TemplateApp {
             port: "".to_owned(),
             send_payload: "".to_owned(),
             send_topic: "".to_owned(),
+            manager: MqttServerManager::new(),
             mqtt_client: None,
             mqtt_jh: None,
             mqtt_receiver: None,
@@ -103,80 +108,34 @@ impl eframe::App for TemplateApp {
             ui.horizontal(|ui| {
                 ui.label("Port: ");
                 ui.text_edit_singleline(&mut self.port);
-                if self.mqtt_jh.is_none() && ui.button("connect").clicked() {
+                if !self.manager.is_connected() && ui.button("connect").clicked() {
                     let port = self.port.parse::<u16>().unwrap_or(1883);
-                    let rand = fastrand::u16(0..u16::MAX);
-                    let options =
-                        MqttOptions::new(format!("oldqtt_{}", rand), self.host.as_str(), port);
-                    log::debug!("clicked connect");
-                    let (client, mut connection) = Client::new(options, 20);
-                    self.mqtt_client = Some(client);
-                    log::debug!("Connected to {}", self.host);
-                    let (tx, rx) = std::sync::mpsc::channel::<rumqttc::Event>();
-                    let ctx_c = ctx.clone();
-                    self.mqtt_jh = Some(std::thread::spawn(move || {
-                        // loop over notifications
-                        for notification in connection.iter() {
-                            match notification {
-                                Err(error) => {
-                                    log::error!("MQTT Error: {:?}", error);
-                                    return ();
-                                }
-                                Ok(event) => {
-                                    if let Err(e) = tx.send(event) {
-                                        log::error!("Channel Error: {}", e);
-                                    };
-                                    ctx_c.request_repaint_after(Duration::from_millis(10));
-                                }
-                            }
-                        }
-                    }));
-                    self.mqtt_receiver = Some(rx);
-                    self.mqtt_client
-                        .as_ref()
-                        .unwrap()
-                        .subscribe("#", rumqttc::QoS::ExactlyOnce)
-                        .unwrap();
-                } else if self.mqtt_jh.is_some() {
+                    if let Err(e) = self.manager.connect(&self.host, port) {
+                        log::error!("Error connecting: {}", e.to_string())
+                    } else {
+                        self.manager.subscribe();
+                    };
+                } else if self.manager.is_connected() {
                     if ui.button("disconnect").clicked() {
-                        let handle = self.mqtt_jh.take();
-                        let client = self.mqtt_client.take();
-                        if let (Some(client), Some(handle)) = (client, handle) {
-                            client.disconnect().unwrap();
-                            handle.join().unwrap();
-                            self.incoming.clear();
-                        }
+                        self.manager.disconnect();
                     }
                 }
             });
-            if let Some(receiver) = &self.mqtt_receiver {
-                while let Some(event) = receiver.try_recv().ok() {
-                    if let Event::Incoming(_) = event {
-                        log::debug!("Add event to table: {:?}", event);
-                        self.incoming.push(event);
-                    }
-                }
+            for event in self.manager.pull_events() {
+                self.incoming.push(event);
             }
 
             ui.separator();
 
-            if self.mqtt_jh.is_some() {
+            if self.manager.is_connected() {
                 ui.horizontal(|ui| {
                     ui.label("Topic: ");
                     ui.text_edit_singleline(&mut self.send_topic);
                     ui.label("Payload: ");
                     ui.text_edit_singleline(&mut self.send_payload);
                     if ui.button("send").clicked() {
-                        if let Some(client) = &self.mqtt_client {
-                            client
-                                .publish(
-                                    &self.send_topic,
-                                    rumqttc::QoS::ExactlyOnce,
-                                    false,
-                                    self.send_payload.as_str(),
-                                )
-                                .unwrap();
-                        }
+                        self.manager
+                            .publish(self.send_topic.clone(), self.send_payload.clone());
                     }
                 });
                 TableBuilder::new(ui)
@@ -194,18 +153,16 @@ impl eframe::App for TemplateApp {
                     })
                     .body(|mut body| {
                         for event in &self.incoming {
-                            if let Event::Incoming(Incoming::Publish(publish)) = event {
-                                let topic = publish.topic.clone();
-                                let payload = String::from_utf8(publish.payload.to_vec()).unwrap();
-                                body.row(30.0, |mut row| {
-                                    row.col(|ui| {
-                                        ui.label(topic);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(payload);
-                                    });
+                            let topic = event.event.topic.clone();
+                            let payload = String::from_utf8(event.event.payload.to_vec()).unwrap();
+                            body.row(30.0, |mut row| {
+                                row.col(|ui| {
+                                    ui.label(topic);
                                 });
-                            }
+                                row.col(|ui| {
+                                    ui.label(payload);
+                                });
+                            });
                         }
                     });
             }
@@ -215,7 +172,6 @@ impl eframe::App for TemplateApp {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 powered_by_egui_and_eframe(ui);
                 egui::warn_if_debug_build(ui);
-                ui.separator();
             });
         });
     }
