@@ -1,7 +1,20 @@
-use std::{sync::mpsc::Receiver, thread::JoinHandle, time::Duration};
+use std::{
+    sync::{mpsc::Receiver, Arc},
+    thread::JoinHandle,
+    time::Duration,
+    usize,
+};
 
+use egui::{
+    ahash::HashMap, mutex::Mutex, vec2, Button, Color32, Context, Layout, ScrollArea,
+    SelectableLabel, Ui, Window,
+};
 use egui_extras::{Column, TableBuilder};
-use rumqttc::{Client, Event, Incoming, MqttOptions};
+use rumqttc::{
+    tokio_rustls::rustls::pki_types::SignatureVerificationAlgorithm, Client, Event, Incoming,
+    MqttOptions,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::mqtt_servermanager::{MqttServerManager, MqttServerManagerEvent};
 
@@ -26,6 +39,117 @@ pub struct TemplateApp {
     mqtt_receiver: Option<Receiver<Event>>,
     #[serde(skip)]
     incoming: Vec<MqttServerManagerEvent>,
+    servers: MqttServers,
+}
+
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct MqttServer {
+    edit_display: bool,
+    name: String,
+    host: String,
+    port: String,
+    new_subscription: String,
+    subscriptions: Vec<String>,
+}
+
+impl MqttServer {
+    fn new() -> Self {
+        Self {
+            edit_display: true,
+            ..Self::default()
+        }
+    }
+    fn name(&self) -> String {
+        if !self.name.is_empty() {
+            return self.name.to_owned();
+        }
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct MqttServers(HashMap<u16, MqttServer>);
+
+impl MqttServers {
+    fn push(&mut self, server: MqttServer) {
+        let id = fastrand::u16(0..u16::MAX);
+        self.0.insert(id, server);
+    }
+    fn get_by_index(&self, id: &u16) -> Option<&MqttServer> {
+        self.0.get(id)
+    }
+    fn selectable_list(&mut self, ui: &mut Ui) {
+        ui.vertical(|ui| {
+            ui.with_layout(Layout::top_down_justified(egui::Align::Center), |ui| {
+                for (_, server) in self.0.iter_mut() {
+                    if ui.button(server.name()).clicked() {
+                        server.edit_display = true;
+                    }
+                }
+            });
+        });
+    }
+
+    fn edit_windows(&mut self, ctx: &Context) {
+        let mut delete_ids = vec![];
+        for (id, server) in self.0.iter_mut() {
+            egui::Window::new(server.name())
+                .id(id.to_string().into())
+                .open(&mut server.edit_display)
+                .show(ctx, |ui| {
+                    ui.label(id.to_string());
+                    ui.separator();
+                    ui.heading("Connection");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut server.host).hint_text("127.0.0.1"));
+                        ui.label("Host");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut server.port).hint_text("1883"));
+                        ui.label("Port");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut server.name).hint_text("alias"));
+                        ui.label("Alias");
+                    });
+                    ui.separator();
+                    ui.heading("Subscriptions");
+                    let mut delete_subs = vec![];
+                    for sub in server.subscriptions.iter_mut() {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(sub).interactive(false));
+                            if ui.button("Del").clicked() {
+                                delete_subs.push(sub.clone());
+                            }
+                        });
+                    }
+                    server
+                        .subscriptions
+                        .retain(|sub| !delete_subs.contains(sub));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut server.new_subscription).hint_text("#"),
+                        );
+                        if ui.button("Add").clicked() {
+                            server.subscriptions.push(server.new_subscription.clone());
+                            server.new_subscription.clear();
+                        }
+                    });
+                    ui.separator();
+                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("Delete").fill(Color32::DARK_RED))
+                            .clicked()
+                        {
+                            delete_ids.push(*id);
+                        }
+                    });
+                });
+        }
+        for id in delete_ids {
+            self.0.remove(&id);
+        }
+    }
 }
 
 impl Default for TemplateApp {
@@ -41,6 +165,7 @@ impl Default for TemplateApp {
             mqtt_jh: None,
             mqtt_receiver: None,
             incoming: vec![],
+            servers: MqttServers::default(),
         }
     }
 }
@@ -69,6 +194,9 @@ impl eframe::App for TemplateApp {
 
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        for event in self.manager.pull_events() {
+            self.incoming.push(event);
+        }
         // Put your widgets into a `SidePanel`, `TopBottomPanel`, `CentralPanel`, `Window` or `Area`.
         // For inspiration and more examples, go to https://emilk.github.io/egui
 
@@ -80,92 +208,37 @@ impl eframe::App for TemplateApp {
                 let is_web = cfg!(target_arch = "wasm32");
                 if !is_web {
                     ui.menu_button("File", |ui| {
+                        if ui.button("Reset App Settings").clicked() {
+                            *self = Self::default();
+                        }
                         if ui.button("Quit").clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
                     ui.add_space(0.0);
                 }
-
                 egui::widgets::global_theme_preference_buttons(ui);
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // The central panel the region left after adding TopPanel's and SidePanel's
-            let heading = if self.mqtt_client.is_none() {
-                "Connect to MQTT"
-            } else {
-                "MQTT Connected!"
-            };
-            ui.heading(heading);
-
-            ui.horizontal(|ui| {
-                ui.label("Host: ");
-                ui.text_edit_singleline(&mut self.host);
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Port: ");
-                ui.text_edit_singleline(&mut self.port);
-                if !self.manager.is_connected() && ui.button("connect").clicked() {
-                    let port = self.port.parse::<u16>().unwrap_or(1883);
-                    if let Err(e) = self.manager.connect(&self.host, port) {
-                        log::error!("Error connecting: {}", e.to_string())
-                    } else {
-                        self.manager.subscribe();
-                    };
-                } else if self.manager.is_connected() {
-                    if ui.button("disconnect").clicked() {
-                        self.manager.disconnect();
-                    }
-                }
-            });
-            for event in self.manager.pull_events() {
-                self.incoming.push(event);
-            }
-
-            ui.separator();
-
-            if self.manager.is_connected() {
+        egui::SidePanel::left("mqtt_servers")
+            .max_width(450.0)
+            .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Topic: ");
-                    ui.text_edit_singleline(&mut self.send_topic);
-                    ui.label("Payload: ");
-                    ui.text_edit_singleline(&mut self.send_payload);
-                    if ui.button("send").clicked() {
-                        self.manager
-                            .publish(self.send_topic.clone(), self.send_payload.clone());
+                    ui.heading("MQTT Servers");
+                    if ui.button("New").clicked() {
+                        self.servers.push(MqttServer::new());
                     }
                 });
-                TableBuilder::new(ui)
-                    .column(Column::auto().at_least(50.0).resizable(true))
-                    .column(Column::remainder())
-                    .striped(true)
-                    .resizable(true)
-                    .header(20.0, |mut header| {
-                        header.col(|ui| {
-                            ui.heading("Topic");
-                        });
-                        header.col(|ui| {
-                            ui.heading("Payload");
-                        });
-                    })
-                    .body(|mut body| {
-                        for event in &self.incoming {
-                            let topic = event.event.topic.clone();
-                            let payload = String::from_utf8(event.event.payload.to_vec()).unwrap();
-                            body.row(30.0, |mut row| {
-                                row.col(|ui| {
-                                    ui.label(topic);
-                                });
-                                row.col(|ui| {
-                                    ui.label(payload);
-                                });
-                            });
-                        }
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        self.servers.selectable_list(ui);
                     });
-            }
+                });
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.servers.edit_windows(ctx);
         });
 
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
