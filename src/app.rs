@@ -1,4 +1,4 @@
-use std::{sync::mpsc::Receiver, thread::JoinHandle};
+use std::{collections::VecDeque, sync::mpsc::Receiver, thread::JoinHandle};
 
 use egui::{ahash::HashMap, epaint::ColorMode, Color32, Context, Layout, ScrollArea, Stroke, Ui};
 use egui_extras::Column;
@@ -46,7 +46,9 @@ pub struct MqttServer {
     new_pub_payload: String,
     subscriptions: Vec<String>,
     #[serde(skip)]
-    messages: Vec<MqttServerManagerEvent>,
+    messages: VecDeque<MqttServerManagerEvent>,
+    max_messages: usize,
+    table_messages: usize,
 }
 
 impl MqttServer {
@@ -60,7 +62,7 @@ impl MqttServer {
         if !self.name.is_empty() {
             return self.name.to_owned();
         }
-        format!("{}:{}", self.host, self.port)
+        format!("{}:{}", self.host(), self.port())
     }
     pub fn port(&self) -> u16 {
         self.port.parse().unwrap_or(1883)
@@ -86,7 +88,10 @@ impl MqttServers {
     }
     fn push(&mut self, event: MqttServerManagerEvent) {
         if let Some(server) = self.servers.get_mut(&event.client) {
-            server.messages.push(event);
+            server.messages.push_back(event);
+            if server.messages.len() > server.max_messages {
+                server.messages.pop_front();
+            }
         }
     }
     fn _get(&self, id: &u32) -> Option<&MqttServer> {
@@ -137,6 +142,15 @@ impl MqttServers {
                 .default_height(150.0)
                 .show(ctx, |ui| {
                     ui.small(format!("'{:x}' connected: {}", id, connected));
+                    ui.small(format!("'{:x}' messages: {}", id, server.messages.len()));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(
+                            &mut server.table_messages,
+                            (0 as usize)..=(10_000 as usize),
+                        ));
+                        ui.label("max rendered messages in table");
+                    });
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.add(
@@ -173,7 +187,11 @@ impl MqttServers {
                             });
                         })
                         .body(|mut body| {
+                            let mut exit_count = 0;
                             for message in server.messages.iter().rev() {
+                                if exit_count >= server.table_messages {
+                                    return;
+                                }
                                 let event = &message.event;
                                 body.row(10.0, |mut row| {
                                     row.col(|ui| {
@@ -185,6 +203,7 @@ impl MqttServers {
                                                 .unwrap_or(String::from("ERROR PARSING UTF8")),
                                         );
                                     });
+                                    exit_count += 1;
                                 });
                             }
                         });
@@ -226,6 +245,13 @@ impl MqttServers {
                                 .interactive(!connected),
                         );
                         ui.label("Alias");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(
+                            &mut server.max_messages,
+                            (0 as usize)..=(1_000_000 as usize),
+                        ));
+                        ui.label("max stored messages");
                     });
                     ui.separator();
                     ui.heading("Subscriptions");

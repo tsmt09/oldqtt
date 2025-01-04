@@ -4,7 +4,9 @@
 // When compiling natively:
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
-    std::env::set_var("RUST_LOG", "DEBUG");
+    if std::env::var("RUST_LOG").ok().is_none() {
+        std::env::set_var("RUST_LOG", "INFO");
+    }
     pretty_env_logger::init_timed();
 
     let native_options = eframe::NativeOptions {

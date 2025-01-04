@@ -71,11 +71,8 @@ impl MqttServerManager {
 
 pub struct Server {
     id: u32,
-    host: String,
-    port: u16,
     client: rumqttc::Client,
     handle: JoinHandle<()>,
-    channel: Sender<MqttServerManagerEvent>,
     current_subs: HashSet<String>,
 }
 
@@ -90,7 +87,8 @@ impl Server {
     where
         S: Into<String> + Clone,
     {
-        let options = MqttOptions::new(format!("oldqtt_{}", id), host.clone(), port);
+        let mut options = MqttOptions::new(format!("oldqtt_{}", id), host.clone(), port);
+        options.set_max_packet_size(6000000, 6000000);
         let (client, connection) = Client::new(options, 20);
         let channel_c = channel.clone();
         let handle = std::thread::spawn(move || {
@@ -100,10 +98,7 @@ impl Server {
         });
         Server {
             id,
-            host: host.into(),
-            port,
             client,
-            channel,
             handle,
             current_subs: HashSet::new(),
         }
@@ -138,7 +133,7 @@ impl Server {
                         ctx.request_repaint();
                     }
                     Err(e) => {
-                        log::error!("mqtt error: {}", e);
+                        log::error!("mqtt error: {:?}", e);
                     }
                     _ => {
                         log::debug!("incoming: {:?}", event);
@@ -210,5 +205,8 @@ impl Server {
         {
             log::error!("Error publishing: {:?}", e);
         }
+    }
+    pub fn join(self) {
+        self.handle.join();
     }
 }
