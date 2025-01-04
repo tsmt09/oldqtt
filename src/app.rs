@@ -1,22 +1,11 @@
-use std::{
-    sync::{mpsc::Receiver, Arc},
-    thread::JoinHandle,
-    time::Duration,
-    usize,
-};
+use std::{sync::mpsc::Receiver, thread::JoinHandle};
 
-use egui::{
-    ahash::HashMap, mutex::Mutex, vec2, Button, Color32, Context, Layout, ScrollArea,
-    SelectableLabel, Ui, Window,
-};
-use egui_extras::{Column, TableBuilder};
-use rumqttc::{
-    tokio_rustls::rustls::pki_types::SignatureVerificationAlgorithm, Client, Event, Incoming,
-    MqttOptions,
-};
+use egui::{ahash::HashMap, epaint::ColorMode, Color32, Context, Layout, ScrollArea, Stroke, Ui};
+use egui_extras::Column;
+use rumqttc::{Client, Event};
 use serde::{Deserialize, Serialize};
 
-use crate::mqtt_servermanager::{MqttServerManager, MqttServerManagerEvent};
+use crate::mqtt_servermanager::{MqttServerManager, MqttServerManagerEvent, Server};
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -43,73 +32,199 @@ pub struct TemplateApp {
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
-struct MqttServer {
+pub struct MqttServer {
+    display: bool,
     edit_display: bool,
     name: String,
     host: String,
     port: String,
+    #[serde(skip)]
     new_subscription: String,
+    #[serde(skip)]
+    new_pub_topic: String,
+    #[serde(skip)]
+    new_pub_payload: String,
     subscriptions: Vec<String>,
+    #[serde(skip)]
+    messages: Vec<MqttServerManagerEvent>,
 }
 
 impl MqttServer {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             edit_display: true,
             ..Self::default()
         }
     }
-    fn name(&self) -> String {
+    pub fn name(&self) -> String {
         if !self.name.is_empty() {
             return self.name.to_owned();
         }
         format!("{}:{}", self.host, self.port)
     }
+    pub fn port(&self) -> u16 {
+        self.port.parse().unwrap_or(1883)
+    }
+    pub fn host(&self) -> String {
+        if self.host.is_empty() {
+            String::from("127.0.0.1")
+        } else {
+            self.host.clone()
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct MqttServers(HashMap<u16, MqttServer>);
+struct MqttServers {
+    servers: HashMap<u32, MqttServer>,
+}
 
 impl MqttServers {
-    fn push(&mut self, server: MqttServer) {
-        let id = fastrand::u16(0..u16::MAX);
-        self.0.insert(id, server);
+    fn add_server(&mut self, server: MqttServer) {
+        let id = fastrand::u32(0..u32::MAX);
+        self.servers.insert(id, server);
     }
-    fn get_by_index(&self, id: &u16) -> Option<&MqttServer> {
-        self.0.get(id)
+    fn push(&mut self, event: MqttServerManagerEvent) {
+        if let Some(server) = self.servers.get_mut(&event.client) {
+            server.messages.push(event);
+        }
     }
-    fn selectable_list(&mut self, ui: &mut Ui) {
+    fn _get(&self, id: &u32) -> Option<&MqttServer> {
+        self.servers.get(id)
+    }
+    fn selectable_list(&mut self, ui: &mut Ui, manager: &mut MqttServerManager) {
         ui.vertical(|ui| {
-            ui.with_layout(Layout::top_down_justified(egui::Align::Center), |ui| {
-                for (_, server) in self.0.iter_mut() {
-                    if ui.button(server.name()).clicked() {
-                        server.edit_display = true;
-                    }
-                }
-            });
+            for (id, server) in self.servers.iter_mut() {
+                let connected = manager.servers().contains_key(id);
+                ui.with_layout(Layout::top_down_justified(egui::Align::Center), |ui| {
+                    ui.horizontal(|ui| {
+                        let mut button = egui::Button::new(server.name());
+                        if connected {
+                            button = button.stroke(Stroke::new(1.0, Color32::GREEN));
+                        }
+                        if ui.add(button).clicked() {
+                            server.display = true;
+                        }
+                        if ui.button("edit").clicked() {
+                            server.edit_display = true;
+                        }
+                        if !connected {
+                            if ui
+                                .add(egui::Button::new("c").fill(Color32::GREEN))
+                                .clicked()
+                            {
+                                let ctx = ui.ctx().clone();
+                                manager.connect(*id, server, ctx);
+                            }
+                        } else {
+                            if ui.add(egui::Button::new("d")).clicked() {
+                                manager.disconnect(*id);
+                            }
+                        }
+                    });
+                });
+            }
         });
     }
 
-    fn edit_windows(&mut self, ctx: &Context) {
+    fn windows(&mut self, ctx: &Context, manager: &mut MqttServerManager) {
+        for (id, server) in self.servers.iter_mut() {
+            let connected = manager.servers().contains_key(id);
+            egui::Window::new(format!("MQTT: {}", server.name()))
+                .id(format!("mqtt_{}", id).into())
+                .open(&mut server.display)
+                .default_width(150.0)
+                .default_height(150.0)
+                .show(ctx, |ui| {
+                    ui.small(format!("'{:x}' connected: {}", id, connected));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut server.new_pub_topic)
+                                .hint_text("topic")
+                                .interactive(connected),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut server.new_pub_payload)
+                                .hint_text("payload")
+                                .interactive(connected),
+                        );
+                        if ui.button("publish").clicked() {
+                            if let Some(connected_client) = manager.servers().get(id) {
+                                connected_client.publish(
+                                    server.new_pub_topic.clone(),
+                                    server.new_pub_payload.clone(),
+                                );
+                            }
+                        };
+                    });
+                    ui.separator();
+                    egui_extras::TableBuilder::new(ui)
+                        .column(Column::auto().at_least(20.0))
+                        .column(Column::remainder())
+                        .resizable(true)
+                        .striped(true)
+                        .header(20.0, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("Topic");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Payload");
+                            });
+                        })
+                        .body(|mut body| {
+                            for message in server.messages.iter().rev() {
+                                let event = &message.event;
+                                body.row(10.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.label(event.topic.clone());
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(
+                                            String::from_utf8(event.payload.to_vec())
+                                                .unwrap_or(String::from("ERROR PARSING UTF8")),
+                                        );
+                                    });
+                                });
+                            }
+                        });
+                });
+        }
+    }
+
+    fn edit_windows(&mut self, ctx: &Context, manager: &mut MqttServerManager) {
         let mut delete_ids = vec![];
-        for (id, server) in self.0.iter_mut() {
-            egui::Window::new(server.name())
+        for (id, server) in self.servers.iter_mut() {
+            let connected = manager.servers().contains_key(id);
+            egui::Window::new(format!("Edit {}", server.name()))
                 .id(id.to_string().into())
                 .open(&mut server.edit_display)
                 .show(ctx, |ui| {
-                    ui.label(id.to_string());
+                    ui.small(format!("random id: {:0x}", id));
                     ui.separator();
                     ui.heading("Connection");
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut server.host).hint_text("127.0.0.1"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut server.host)
+                                .hint_text("127.0.0.1")
+                                .interactive(!connected),
+                        );
                         ui.label("Host");
                     });
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut server.port).hint_text("1883"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut server.port)
+                                .hint_text("1883")
+                                .interactive(!connected),
+                        );
                         ui.label("Port");
                     });
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut server.name).hint_text("alias"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut server.name)
+                                .hint_text("alias")
+                                .interactive(!connected),
+                        );
                         ui.label("Alias");
                     });
                     ui.separator();
@@ -136,18 +251,36 @@ impl MqttServers {
                         }
                     });
                     ui.separator();
+                    // if !manager.servers().contains_key(id) {
+                    //     if ui
+                    //         .add(egui::Button::new("Connect").fill(Color32::GREEN))
+                    //         .clicked()
+                    //     {
+                    //         let ctx = ui.ctx().clone();
+                    //         manager.connect(*id, server, ctx);
+                    //     }
+                    // } else {
+                    //     if ui.add(egui::Button::new("Disconnect")).clicked() {
+                    //         manager.disconnect(*id);
+                    //         server.display = false;
+                    //     }
+                    // }
                     ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new("Delete").fill(Color32::DARK_RED))
+                            .add(egui::Button::new("Delete").fill(Color32::RED))
                             .clicked()
                         {
                             delete_ids.push(*id);
                         }
                     });
                 });
+            if let Some(mqtt_server) = manager.servers_mut().get_mut(id) {
+                mqtt_server.sync_subs(&server.subscriptions.clone());
+            }
         }
         for id in delete_ids {
-            self.0.remove(&id);
+            manager.disconnect(id);
+            self.servers.remove(&id);
         }
     }
 }
@@ -195,7 +328,7 @@ impl eframe::App for TemplateApp {
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         for event in self.manager.pull_events() {
-            self.incoming.push(event);
+            self.servers.push(event);
         }
         // Put your widgets into a `SidePanel`, `TopBottomPanel`, `CentralPanel`, `Window` or `Area`.
         // For inspiration and more examples, go to https://emilk.github.io/egui
@@ -221,24 +354,25 @@ impl eframe::App for TemplateApp {
             });
         });
 
-        egui::SidePanel::left("mqtt_servers")
+        egui::SidePanel::left("mqtt_clients")
             .max_width(450.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("MQTT Servers");
+                    ui.heading("MQTT Clients");
                     if ui.button("New").clicked() {
-                        self.servers.push(MqttServer::new());
+                        self.servers.add_server(MqttServer::new());
                     }
                 });
                 ScrollArea::vertical().show(ui, |ui| {
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                        self.servers.selectable_list(ui);
+                        self.servers.selectable_list(ui, &mut self.manager);
                     });
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.servers.edit_windows(ctx);
+        egui::CentralPanel::default().show(ctx, |_| {
+            self.servers.edit_windows(ctx, &mut self.manager);
+            self.servers.windows(ctx, &mut self.manager);
         });
 
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {

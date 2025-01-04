@@ -1,28 +1,30 @@
 use std::{
+    collections::{HashMap, HashSet},
     error::Error,
-    sync::{
-        mpsc::{Receiver, Sender},
-        Arc, Mutex,
-    },
+    sync::mpsc::{Receiver, Sender},
     thread::JoinHandle,
 };
 
-use rumqttc::{Client, ConnectionError, Event, Incoming, Iter, MqttOptions, Outgoing, Publish};
+use egui::Context;
+use rumqttc::{Client, Event, Incoming, MqttOptions, Outgoing, Publish};
 
+use crate::app::MqttServer;
+
+#[derive(Clone)]
 pub struct MqttServerManagerEvent {
     pub event: Publish,
-    pub server: u16,
+    pub client: u32,
 }
 
 pub struct MqttServerManager {
-    servers: Arc<Mutex<Vec<Server>>>,
+    servers: HashMap<u32, Server>,
     channel_tx: Sender<MqttServerManagerEvent>,
     channel_rx: Receiver<MqttServerManagerEvent>,
 }
 
 impl MqttServerManager {
     pub fn new() -> Self {
-        let servers = Arc::new(Mutex::new(vec![]));
+        let servers = HashMap::new();
         let (channel_tx, channel_rx) = std::sync::mpsc::channel::<MqttServerManagerEvent>();
         MqttServerManager {
             servers,
@@ -31,29 +33,16 @@ impl MqttServerManager {
         }
     }
 
-    pub fn connect<S>(&self, host: S, port: u16) -> Result<(), Box<dyn Error + '_>>
-    where
-        S: Into<String> + Clone,
-    {
-        let server = Server::connect(host, port, self.channel_tx.clone());
-        self.servers.lock()?.push(server);
-        Ok(())
+    pub fn servers(&self) -> &HashMap<u32, Server> {
+        &self.servers
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.servers
-            .lock()
-            .and_then(|servers| Ok(!servers.is_empty()))
-            .unwrap_or(false)
+    pub fn channel(&self) -> Sender<MqttServerManagerEvent> {
+        self.channel_tx.clone()
     }
 
-    pub fn disconnect(&self) {
-        if let Ok(mut servers) = self.servers.lock() {
-            for server in servers.iter() {
-                server.client().disconnect().unwrap();
-            }
-            servers.clear();
-        }
+    pub fn servers_mut(&mut self) -> &mut HashMap<u32, Server> {
+        &mut self.servers
     }
 
     pub fn pull_events(&self) -> Vec<MqttServerManagerEvent> {
@@ -64,63 +53,67 @@ impl MqttServerManager {
         events
     }
 
-    pub fn subscribe(&self) {
-        if let Ok(servers) = self.servers.lock() {
-            for server in servers.iter() {
-                server.client().subscribe("#", rumqttc::QoS::ExactlyOnce);
-            }
-        }
+    pub fn connect(&mut self, id: u32, server: &MqttServer, ctx: Context) {
+        let port: u16 = server.port();
+        let host: String = server.host();
+        let mqtt_server = Server::connect(host, port, self.channel(), id, ctx);
+        self.servers_mut().insert(id, mqtt_server);
     }
-    pub fn publish(&self, topic: String, payload: String) {
-        if let Ok(servers) = self.servers.lock() {
-            for server in servers.iter() {
-                server.client().publish(
-                    topic.clone(),
-                    rumqttc::QoS::ExactlyOnce,
-                    false,
-                    payload.clone(),
-                );
+
+    pub fn disconnect(&mut self, id: u32) {
+        if let Some(server) = self.servers_mut().remove(&id) {
+            if let Err(e) = server.client().disconnect() {
+                log::error!("Cannot disconnect client '{}': '{}'", id, e);
             }
         }
     }
 }
 
-struct Server {
-    id: u16,
+pub struct Server {
+    id: u32,
     host: String,
     port: u16,
     client: rumqttc::Client,
     handle: JoinHandle<()>,
     channel: Sender<MqttServerManagerEvent>,
+    current_subs: HashSet<String>,
 }
 
 impl Server {
-    fn connect<S>(host: S, port: u16, channel: Sender<MqttServerManagerEvent>) -> Self
+    pub fn connect<S>(
+        host: S,
+        port: u16,
+        channel: Sender<MqttServerManagerEvent>,
+        id: u32,
+        ctx: Context,
+    ) -> Self
     where
         S: Into<String> + Clone,
     {
-        let rand = fastrand::u16(0..u16::MAX);
-        let options = MqttOptions::new(format!("oldqtt_{}", rand), host.clone(), port);
+        let options = MqttOptions::new(format!("oldqtt_{}", id), host.clone(), port);
         let (client, connection) = Client::new(options, 20);
-        let client_c = client.clone();
         let channel_c = channel.clone();
         let handle = std::thread::spawn(move || {
-            Self::poll_iter(connection, client_c, channel_c);
+            log::info!("MQTT Event Loop started.");
+            Self::poll_iter(connection, channel_c, id, ctx);
+            log::info!("MQTT Event Loop ended.");
         });
         Server {
-            id: rand,
+            id,
             host: host.into(),
             port,
             client,
             channel,
             handle,
+            current_subs: HashSet::new(),
         }
     }
 
     fn poll_iter(
         mut connection: rumqttc::Connection,
-        client: rumqttc::Client,
         channel: Sender<MqttServerManagerEvent>,
+        id: u32,
+        ctx: Context,
     ) {
         loop {
             for event in connection.iter() {
@@ -138,13 +131,14 @@ impl Server {
                         );
                         if let Err(error) = channel.send(MqttServerManagerEvent {
                             event: message,
-                            server: 0,
+                            client: id,
                         }) {
                             log::error!("Error sending event to channel: {}", error)
                         };
+                        ctx.request_repaint();
                     }
                     Err(e) => {
-                        log::error!("connection error: {}", e);
+                        log::error!("mqtt error: {}", e);
                     }
                     _ => {
                         log::debug!("incoming: {:?}", event);
@@ -158,7 +152,63 @@ impl Server {
         &self.client
     }
 
-    fn id(&self) -> u16 {
-        self.id
+    pub fn sync_subs(&mut self, subs: &Vec<String>) -> Result<(), Box<dyn Error>> {
+        let to_sub: Vec<String> = subs
+            .iter()
+            .filter(|sub| !self.current_subs.contains(*sub))
+            .cloned()
+            .collect();
+        let to_unsub: Vec<String> = self
+            .current_subs
+            .iter()
+            .filter(|sub| !subs.contains(sub))
+            .cloned()
+            .collect();
+        for sub in to_sub {
+            self.subscribe(sub)?;
+        }
+        for sub in to_unsub {
+            self.unsubscribe(sub)?;
+        }
+        Ok(())
+    }
+
+    fn subscribe(&mut self, topic: String) -> Result<(), Box<dyn Error>> {
+        if self.current_subs.insert(topic.clone()) {
+            log::debug!("Client '{}' subscribing '{}'", self.id, &topic);
+            if let Err(e) = self.client().subscribe(topic, rumqttc::QoS::ExactlyOnce) {
+                return Err(Box::new(e));
+            };
+        }
+        Ok(())
+    }
+
+    fn unsubscribe(&mut self, topic: String) -> Result<(), Box<dyn Error>> {
+        if let Some(topic) = self.current_subs.take(&topic) {
+            log::debug!("Client '{}' unsubscribing '{}'", self.id, &topic);
+            if let Err(e) = self.client().unsubscribe(topic) {
+                return Err(Box::new(e));
+            };
+        }
+        Ok(())
+    }
+
+    pub fn publish<S, V>(&self, topic: S, payload: V)
+    where
+        S: Into<String> + std::fmt::Debug,
+        V: Into<Vec<u8>> + std::fmt::Debug,
+    {
+        log::debug!(
+            "Client '{}' publishing '{:?}' on topic '{:?}'",
+            self.id,
+            &payload,
+            &topic
+        );
+        if let Err(e) = self
+            .client()
+            .publish(topic, rumqttc::QoS::ExactlyOnce, false, payload)
+        {
+            log::error!("Error publishing: {:?}", e);
+        }
     }
 }
